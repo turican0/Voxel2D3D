@@ -58,7 +58,8 @@ Viewer: drag = rotate, wheel = zoom, space = auto-rotate, `R` = reset, `Esc` = q
    evenly spaced layouts (both rotation directions).
 5. **Final model.** Evidence on a tight grid, largest connected component, colours from the
    views that see the voxel best, surface mesh with vertex colours -> GLB (+Y up, +Z front,
-   `--rotate` turns it).
+   `--rotate` turns it). Vertex colours are written as normalized `UNSIGNED_BYTE` `COLOR_0`
+   (linear), which Blender, three.js and Godot read; note that `trimesh` ignores it.
 
 ## Conventions
 
@@ -74,6 +75,8 @@ the object. World unit = one pixel of the source images (scaled to `--height` on
   8-frame character sprite sheet): it needs a hint. If you know (or can read off the widths of the
   silhouettes) the step between frames, `--yaw-step` fixes it and the estimator only handles the
   per-image deviations (`--yaw-dev`), pitch, vertical stretch and shifts. `--angles` pins them completely.
+* The estimated pitch of the sample sprite sheet came out lower (~8 deg) than it looks; the model
+  is still coherent from novel angles, but treat the estimated pitch as approximate (`--pitch` fixes it).
 * Thin parts (arms, cloth) shrink in a visual hull built from few views.
 * The SDL3 viewer is a simple software renderer (surface voxels as squares); fine for a preview,
   not for huge grids.

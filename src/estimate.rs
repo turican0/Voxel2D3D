@@ -760,7 +760,36 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
         }
     }
     let (_, mut poses, mut pitch, mut vs, li) = best.unwrap();
-    let init_yaw = layouts[li].clone();
+    let mut init_yaw = layouts[li].clone();
+
+    // ---- continuous refinement of the even angular step (turntable mode)
+    if cfg.turntable && !all_hinted && k_n > 2 {
+        let step0 = signed_step(&init_yaw);
+        let dir = if step0 < 0.0 { -1.0f32 } else { 1.0 };
+        let mut best_step = step0.abs();
+        let mut best_sc = f32::NEG_INFINITY;
+        for i in -8..=8 {
+            let st = step0.abs() + i as f32 * 0.4;
+            if st <= 1.0 {
+                continue;
+            }
+            let y: Vec<f32> = (0..k_n).map(|k| cfg.yaw_hints[k].unwrap_or((dir * st * k as f32).rem_euclid(360.0))).collect();
+            let (sc, _) = mk(&y, vs, max_dim / 24.0, 0).quick_score(&zero_poses(&y), pitch, pitch_fixed);
+            if cfg.verbose {
+                eprintln!("  step refine {:6.2}: score {:.4}", dir * st, sc);
+            }
+            if sc > best_sc {
+                best_sc = sc;
+                best_step = st;
+            }
+        }
+        if (best_step - step0.abs()).abs() > 1e-3 {
+            init_yaw = (0..k_n).map(|k| cfg.yaw_hints[k].unwrap_or((dir * best_step * k as f32).rem_euclid(360.0))).collect();
+            for k in 0..k_n {
+                poses[k].yaw = init_yaw[k];
+            }
+        }
+    }
 
     // ---- phase B / C: finer grids, sharper silhouettes
     let mut score = 0.0;

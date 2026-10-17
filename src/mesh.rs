@@ -121,7 +121,10 @@ pub fn write_glb(path: &Path, mesh: &Mesh, name: &str) -> std::io::Result<()> {
     }
     let off_col = bin.len();
     for c in &mesh.col {
-        push_f32(&mut bin, c);
+        // COLOR_0 as normalized unsigned bytes (linear): the most widely supported form
+        for ch in c {
+            bin.push((ch.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        }
     }
     let off_idx = bin.len();
     for i in &mesh.idx {
@@ -157,13 +160,13 @@ pub fn write_glb(path: &Path, mesh: &Mesh, name: &str) -> std::io::Result<()> {
         "accessors": [
             { "bufferView": 0, "componentType": 5126, "count": nv, "type": "VEC3", "min": mn, "max": mx },
             { "bufferView": 1, "componentType": 5126, "count": nv, "type": "VEC3" },
-            { "bufferView": 2, "componentType": 5126, "count": nv, "type": "VEC4" },
+            { "bufferView": 2, "componentType": 5121, "normalized": true, "count": nv, "type": "VEC4" },
             { "bufferView": 3, "componentType": 5125, "count": mesh.idx.len(), "type": "SCALAR" }
         ],
         "bufferViews": [
             { "buffer": 0, "byteOffset": off_pos, "byteLength": nv * 12, "target": 34962 },
             { "buffer": 0, "byteOffset": off_nrm, "byteLength": nv * 12, "target": 34962 },
-            { "buffer": 0, "byteOffset": off_col, "byteLength": nv * 16, "target": 34962 },
+            { "buffer": 0, "byteOffset": off_col, "byteLength": nv * 4, "target": 34962 },
             { "buffer": 0, "byteOffset": off_idx, "byteLength": mesh.idx.len() * 4, "target": 34963 }
         ],
         "buffers": [{ "byteLength": bin.len() }]
