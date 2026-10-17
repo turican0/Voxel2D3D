@@ -49,6 +49,8 @@ CAMERA / ALIGNMENT
                              independently (needs many images / distinctive shapes)
         --yaw-step DEG       known angle between consecutive images (e.g. 25.714 for 8 images over
                              180 degrees); both rotation directions are still tried
+        --span DEG           the images evenly cover this angle, first to last (180 = half circle,
+                             typical for mirrored sprite sheets; 360 = full circle)
         --yaw-dev DEG        largest deviation of an image from the even spacing (default 8)
         --normalize-height   scale every image so the silhouette heights match
                              (for drawings made at different zoom levels)
@@ -90,6 +92,7 @@ struct Opts {
     free_angles: bool,
     yaw_dev: f32,
     yaw_step: Option<f32>,
+    span: Option<f32>,
     e: f32,
     q: f32,
     prior: f32,
@@ -121,6 +124,7 @@ fn parse_args() -> Result<Opts, String> {
         free_angles: false,
         yaw_dev: 8.0,
         yaw_step: None,
+        span: None,
         e: 0.04,
         q: 0.35,
         prior: 0.5,
@@ -157,6 +161,10 @@ fn parse_args() -> Result<Opts, String> {
             "--shift-penalty" => o.shift_penalty = num(&mut it, "--shift-penalty")?,
             "--color-weight" => o.color_weight = num(&mut it, "--color-weight")?,
             "--free-angles" => o.free_angles = true,
+            "--span" => {
+                let span: f32 = num(&mut it, "--span")?;
+                o.span = Some(span);
+            }
             "--yaw-step" => o.yaw_step = Some(num(&mut it, "--yaw-step")?),
             "--yaw-dev" => o.yaw_dev = num(&mut it, "--yaw-dev")?,
             "--normalize-height" => o.normalize = true,
@@ -256,7 +264,9 @@ fn run() -> Result<(), String> {
     cfg.color_weight = o.color_weight;
     cfg.turntable = !o.free_angles;
     cfg.yaw_dev = o.yaw_dev;
-    cfg.yaw_step = o.yaw_step;
+    cfg.yaw_step = o.yaw_step.or_else(|| {
+        o.span.map(|sp| if sp >= 360.0 { sp / views.len() as f32 } else { sp / (views.len() as f32 - 1.0) })
+    });
     cfg.normalize_height = o.normalize;
     cfg.verbose = !o.quiet;
 

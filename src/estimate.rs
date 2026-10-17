@@ -116,6 +116,7 @@ struct Cache {
     ious: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct Problem<'a> {
     views: &'a [View],
     scales: Vec<f32>,
@@ -201,6 +202,12 @@ impl<'a> Problem<'a> {
         }
     }
 
+    fn with_vs(&self, vs: f32) -> Problem<'a> {
+        let mut p = self.clone();
+        p.vs = vs;
+        p
+    }
+
     fn cam(&self, k: usize, pose: &Pose, pitch: f32) -> Cam {
         Cam {
             yaw: pose.yaw,
@@ -260,7 +267,7 @@ impl<'a> Problem<'a> {
         let k_n = self.views.len();
         let s = self.s_rast;
         let ss = s * s;
-        let mut cover = vec![0u8; k_n * ss];
+        let mut cover = vec![0f32; k_n * ss];
         let mut dep = vec![f32::NEG_INFINITY; k_n * ss];
         let bases: Vec<Basis> = poses.iter().map(|p| basis(p.yaw, pitch, self.vs)).collect();
         let cams: Vec<Cam> = (0..k_n).map(|k| self.cam(k, &poses[k], pitch)).collect();
@@ -276,9 +283,12 @@ impl<'a> Problem<'a> {
                 let y = o[1] + (iy as f32 + 0.5) * v;
                 let row = (iz * ny + iy) * nx;
                 for ix in 0..nx {
-                    if total[row + ix] <= thr {
+                    let e = total[row + ix] - thr;
+                    if e <= -2.0 {
                         continue;
                     }
+                    // soft occupancy: smooth objective, much easier for the pattern searches
+                    let pocc = (0.5 + e * 0.25).clamp(0.0, 1.0);
                     let x = o[0] + (ix as f32 + 0.5) * v;
                     for (k, b) in bases.iter().enumerate() {
                         let a = x * b.r[0] + y * b.r[1] + z * b.r[2];
@@ -289,8 +299,10 @@ impl<'a> Problem<'a> {
                         if i0 >= 0 && j0 >= 0 && (i0 as usize) + 1 < s && (j0 as usize) + 1 < s {
                             let base = k * ss + j0 as usize * s + i0 as usize;
                             for off in [0, 1, s, s + 1] {
-                                cover[base + off] = 1;
-                                if t > dep[base + off] {
+                                if pocc > cover[base + off] {
+                                    cover[base + off] = pocc;
+                                }
+                                if e > 0.0 && t > dep[base + off] {
                                     dep[base + off] = t;
                                 }
                             }
@@ -305,8 +317,8 @@ impl<'a> Problem<'a> {
             let p = pw[k];
             let (mut inter, mut sum_p, mut sum_c) = (0.0f32, 0.0f32, 0.0f32);
             for i in 0..ss {
-                let cc = c[i] as f32;
-                inter += cc * p[i];
+                let cc = c[i];
+                inter += cc.min(p[i]);
                 sum_p += p[i];
                 sum_c += cc;
             }
@@ -599,38 +611,69 @@ impl<'a> Problem<'a> {
         (s.max(cache.score), if s > cache.score { p } else { pitch })
     }
 
-    fn optimize(&self, poses: &mut Vec<Pose>, pitch: &mut f32, fixed: &[bool], pitch_fixed: bool, rounds: usize, tag: &str, verbose: bool) -> f32 {
+    #[allow(clippy::too_many_arguments)]
+    fn optimize(
+        &self,
+        poses: &mut Vec<Pose>,
+        pitch: &mut f32,
+        vs: &mut f32,
+        fixed: &[bool],
+        pitch_fixed: bool,
+        vs_fixed: bool,
+        rounds: usize,
+        tag: &str,
+        verbose: bool,
+    ) -> f32 {
         let k_n = self.views.len();
         let mut last = f32::NEG_INFINITY;
+        let mut me = self.with_vs(*vs);
         for r in 0..rounds {
-            let mut cache = self.build_cache(poses, *pitch);
+            let mut cache = me.build_cache(poses, *pitch);
             for k in 0..k_n {
                 if fixed[k] {
                     continue;
                 }
-                let (y, s) = self.search_yaw(&cache, k);
+                let (y, s) = me.search_yaw(&cache, k);
                 if s > cache.score {
                     let p = Pose { yaw: y, shift: cache.poses[k].shift };
-                    self.apply_view(&mut cache, k, p);
+                    me.apply_view(&mut cache, k, p);
                 }
             }
             for k in 0..k_n {
-                let (sh, s) = self.search_shift(&cache, k);
+                let (sh, s) = me.search_shift(&cache, k);
                 if s > cache.score {
                     let p = Pose { yaw: cache.poses[k].yaw, shift: sh };
-                    self.apply_view(&mut cache, k, p);
+                    me.apply_view(&mut cache, k, p);
                 }
             }
-            if !pitch_fixed {
-                let (p, s) = self.search_pitch(&cache);
-                if s > cache.score {
-                    cache = self.build_cache(&cache.poses.clone(), p);
+            if !pitch_fixed || !vs_fixed {
+                // pitch and vertical stretch are strongly coupled: search them together
+                let factors: &[f32] = if vs_fixed {
+                    &[1.0]
+                } else if r == 0 {
+                    &[0.85, 1.0, 1.15]
+                } else {
+                    &[0.93, 1.0, 1.07]
+                };
+                let mut best = (cache.score, me.vs, cache.pitch);
+                for &f in factors {
+                    let v = (me.vs * f).clamp(0.4, 1.8);
+                    let p2 = me.with_vs(v);
+                    let (p, s) = if pitch_fixed { (cache.pitch, p2.eval_pitch(&cache, cache.pitch)) } else { p2.search_pitch(&cache) };
+                    if s > best.0 + 1e-6 {
+                        best = (s, v, p);
+                    }
+                }
+                if best.0 > cache.score + 1e-6 {
+                    me = self.with_vs(best.1);
+                    cache = me.build_cache(&cache.poses.clone(), best.2);
                 }
             }
             *poses = cache.poses.clone();
             *pitch = cache.pitch;
+            *vs = me.vs;
             if verbose {
-                eprintln!("  [{tag}] round {}: score {:.4}  pitch {:.1}", r + 1, cache.score, cache.pitch);
+                eprintln!("  [{tag}] round {}: score {:.4}  pitch {:.1}  vscale {:.2}", r + 1, cache.score, cache.pitch, me.vs);
             }
             if (cache.score - last).abs() < 1e-4 {
                 last = cache.score;
@@ -736,92 +779,71 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     let top = layouts.len().min(3);
 
-    // ---- phase A2: for the best layouts choose the vertical stretch, then optimise (coarse grid, blurry silhouettes)
-    let vs_cands: Vec<f32> = if vs_fixed { vec![vs0] } else { vec![0.8, 0.9, 1.0, 1.15, 1.3, 1.5] };
-    let mut best: Option<(f32, Vec<Pose>, f32, f32, usize)> = None;
+    // ---- every promising layout goes through the whole pipeline; the best final score wins
+    //      (the cheap ranking above is too coarse to trust on its own)
+    let vs_cands: Vec<f32> = if vs_fixed { vec![vs0] } else { vec![0.6, 0.8, 0.9, 1.0, 1.15, 1.3, 1.5] };
+    let mut best: Option<(f32, Vec<Pose>, f32, f32, Vec<f32>)> = None;
     for (n, &(_, p0, i)) in ranked.iter().take(top).enumerate() {
         let yaws = &layouts[i];
+        // vertical stretch for this layout
         let (mut bvs, mut bsc, mut bp) = (vs0, f32::NEG_INFINITY, p0);
-        for &vs in &vs_cands {
-            let (sc, p) = mk(yaws, vs, max_dim / 16.0, 0).quick_score(&zero_poses(yaws), p0, pitch_fixed);
+        for &v in &vs_cands {
+            let (sc, p) = mk(yaws, v, max_dim / 16.0, 0).quick_score(&zero_poses(yaws), p0, pitch_fixed);
             if sc > bsc {
                 bsc = sc;
-                bvs = vs;
+                bvs = v;
                 bp = p;
             }
         }
-        let prob = mk(yaws, bvs, max_dim / 24.0, 0);
+        // coarse grid, blurry silhouettes
         let mut poses = zero_poses(yaws);
         let mut pitch = bp;
-        let tag = format!("candidate {}/{} (step {:.1}, vscale {:.2})", n + 1, top, signed_step(yaws), bvs);
-        let sc = prob.optimize(&mut poses, &mut pitch, &hinted, pitch_fixed, 2, &tag, cfg.verbose);
-        if best.as_ref().map_or(true, |b| sc > b.0) {
-            best = Some((sc, poses, pitch, bvs, i));
-        }
-    }
-    let (_, mut poses, mut pitch, mut vs, li) = best.unwrap();
-    let mut init_yaw = layouts[li].clone();
+        let mut vs = bvs;
+        let mut init_yaw = yaws.clone();
+        let tag = format!("candidate {}/{} (step {:.1})", n + 1, top, signed_step(yaws));
+        mk(&init_yaw, vs, max_dim / 24.0, 0).optimize(&mut poses, &mut pitch, &mut vs, &hinted, pitch_fixed, vs_fixed, 2, &tag, cfg.verbose);
 
-    // ---- continuous refinement of the even angular step (turntable mode)
-    if cfg.turntable && !all_hinted && k_n > 2 {
-        let step0 = signed_step(&init_yaw);
-        let dir = if step0 < 0.0 { -1.0f32 } else { 1.0 };
-        let mut best_step = step0.abs();
-        let mut best_sc = f32::NEG_INFINITY;
-        for i in -8..=8 {
-            let st = step0.abs() + i as f32 * 0.4;
-            if st <= 1.0 {
-                continue;
+        // continuous refinement of the even angular step (not when the user gave the step)
+        if cfg.turntable && !all_hinted && cfg.yaw_step.is_none() && k_n > 2 {
+            let step0 = signed_step(&init_yaw);
+            let dir = if step0 < 0.0 { -1.0f32 } else { 1.0 };
+            let layout_of = |st: f32| -> Vec<f32> { (0..k_n).map(|k| cfg.yaw_hints[k].unwrap_or((dir * st * k as f32).rem_euclid(360.0))).collect() };
+            let base = mk(&init_yaw, vs, max_dim / 24.0, 0).quick_score(&zero_poses(&init_yaw), pitch, pitch_fixed).0;
+            let (mut best_step, mut best_sc) = (step0.abs(), base + 0.005); // must win clearly
+            for j in -4..=4 {
+                if j == 0 {
+                    continue;
+                }
+                let st = step0.abs() + j as f32 * 0.4;
+                let y = layout_of(st);
+                let sc = mk(&y, vs, max_dim / 24.0, 0).quick_score(&zero_poses(&y), pitch, pitch_fixed).0;
+                if sc > best_sc {
+                    best_sc = sc;
+                    best_step = st;
+                }
             }
-            let y: Vec<f32> = (0..k_n).map(|k| cfg.yaw_hints[k].unwrap_or((dir * st * k as f32).rem_euclid(360.0))).collect();
-            let (sc, _) = mk(&y, vs, max_dim / 24.0, 0).quick_score(&zero_poses(&y), pitch, pitch_fixed);
-            if cfg.verbose {
-                eprintln!("  step refine {:6.2}: score {:.4}", dir * st, sc);
-            }
-            if sc > best_sc {
-                best_sc = sc;
-                best_step = st;
+            if (best_step - step0.abs()).abs() > 1e-3 {
+                init_yaw = layout_of(best_step);
+                for k in 0..k_n {
+                    poses[k].yaw = init_yaw[k];
+                }
             }
         }
-        if (best_step - step0.abs()).abs() > 1e-3 {
-            init_yaw = (0..k_n).map(|k| cfg.yaw_hints[k].unwrap_or((dir * best_step * k as f32).rem_euclid(360.0))).collect();
-            for k in 0..k_n {
-                poses[k].yaw = init_yaw[k];
-            }
-        }
-    }
 
-    // ---- phase B / C: finer grids, sharper silhouettes
-    let mut score = 0.0;
-    let mut last: Option<Problem> = None;
-    for (level, div, rounds) in [(1usize, 40.0f32, 2usize), (2, 56.0, 2)] {
-        let prob = mk(&init_yaw, vs, max_dim / div, level);
-        score = prob.optimize(&mut poses, &mut pitch, &hinted, pitch_fixed, rounds, &format!("refine L{level}"), cfg.verbose);
-        last = Some(prob);
-    }
-    // ---- vertical stretch fine tuning
-    if !vs_fixed {
-        let mut improved = false;
-        for f in [0.92f32, 0.96, 1.04, 1.08] {
-            let cand = vs * f;
-            let prob = mk(&init_yaw, cand, max_dim / 56.0, 2);
-            let (sc, p) = prob.quick_score(&poses, pitch, pitch_fixed);
-            if sc > score + 1e-4 {
-                score = sc;
-                pitch = p;
-                vs = cand;
-                improved = true;
-            }
+        // finer grids, sharper silhouettes
+        let mut score = 0.0;
+        for (level, div, rounds) in [(1usize, 40.0f32, 2usize), (2, 56.0, 2)] {
+            let prob = mk(&init_yaw, vs, max_dim / div, level);
+            score = prob.optimize(&mut poses, &mut pitch, &mut vs, &hinted, pitch_fixed, vs_fixed, rounds, &format!("{tag} refine L{level}"), cfg.verbose);
         }
-        if improved {
-            let prob = mk(&init_yaw, vs, max_dim / 56.0, 2);
-            score = prob.optimize(&mut poses, &mut pitch, &hinted, pitch_fixed, 1, "refine vscale", cfg.verbose);
-            last = Some(prob);
+        if best.as_ref().map_or(true, |b| score > b.0) {
+            best = Some((score, poses, pitch, vs, init_yaw));
         }
     }
+    let (score, poses, pitch, vs, init_yaw) = best.unwrap();
 
     // ---- final bookkeeping on the finest estimation grid
-    let prob = last.unwrap();
+    let prob = mk(&init_yaw, vs, max_dim / 56.0, 2);
     let cache = prob.build_cache(&poses, pitch);
     let [nx, ny, nz] = prob.grid.n;
     let (mut lo, mut hi) = ([usize::MAX; 3], [0usize; 3]);

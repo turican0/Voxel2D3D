@@ -25,6 +25,7 @@ cargo build --release --no-default-features
 
 ```sh
 voxel2d3d frames/*.png -o model.glb --report report/        # fully automatic
+voxel2d3d frames/*.png --span 180 -o model.glb              # images cover a half circle evenly
 voxel2d3d frames/*.png --yaw-step 25.714 -o model.glb       # step between images known
 voxel2d3d frames/*.png --angles angles.txt --pitch 30       # yaws (and pitch) known
 voxel2d3d frames/*.png -o model.glb --view                  # open the SDL3 preview
@@ -52,9 +53,10 @@ Viewer: drag = rotate, wheel = zoom, space = auto-rotate, `R` = reset, `Esc` = q
    "occupied", outside = strong evidence for "empty" (log-likelihood ratios from `--noise`,
    `--occlusion`, `--prior`). Occupied iff the sum is positive - a visual hull that tolerates
    an outlier drawing.
-4. **Angle estimation.** Coordinate descent (yaw -> shift -> pitch) maximising: mean IoU of the
-   projected hull with each silhouette + colour consistency of the hull surface between views -
-   shift penalty. Coarse-to-fine in grid size and silhouette softness, started from several
+4. **Angle estimation.** Coordinate descent (yaw -> shift -> pitch + vertical stretch) maximising:
+   mean IoU of the soft projected hull with each silhouette + colour consistency of the hull
+   surface between views - shift penalty. The three best starting layouts each run through the
+   whole pipeline and the best final score wins. Coarse-to-fine in grid size and silhouette softness, started from several
    evenly spaced layouts (both rotation directions).
 5. **Final model.** Evidence on a tight grid, largest connected component, colours from the
    views that see the voxel best, surface mesh with vertex colours -> GLB (+Y up, +Z front,
@@ -72,10 +74,10 @@ the object. World unit = one pixel of the source images (scaled to `--height` on
   negative pitch fits almost as well. This is why pitch is limited to >= 0 by default
   (`--pitch-range`) and colour consistency is part of the score.
 * The fully automatic angle search is **not reliable on small pixel-art sprites** (tested on an
-  8-frame character sprite sheet): it needs a hint. If you know (or can read off the widths of the
+  8-frame character sprite sheet): it needs a hint (`--span 180` / `--yaw-step`). If you know (or can read off the widths of the
   silhouettes) the step between frames, `--yaw-step` fixes it and the estimator only handles the
   per-image deviations (`--yaw-dev`), pitch, vertical stretch and shifts. `--angles` pins them completely.
-* The estimated pitch of the sample sprite sheet came out lower (~8 deg) than it looks; the model
+* The estimated pitch of the sample sprite sheet came out lower (~9 deg) than it looks; the model
   is still coherent from novel angles, but treat the estimated pitch as approximate (`--pitch` fixes it).
 * Thin parts (arms, cloth) shrink in a visual hull built from few views.
 * The SDL3 viewer is a simple software renderer (surface voxels as squares); fine for a preview,
