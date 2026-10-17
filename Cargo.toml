@@ -1,0 +1,22 @@
+[package]
+name = "voxel2d3d"
+version = "0.1.0"
+edition = "2021"
+description = "Reconstruct the most probable voxel model from hand-drawn 2D views (angles auto-estimated) and export it to GLB"
+license = "MIT"
+repository = "https://github.com/turican0/Voxel2D3D"
+
+[features]
+default = ["viewer"]
+# Interactive SDL3 preview window. Build without it: cargo build --release --no-default-features
+viewer = ["dep:sdl3"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+rayon = "1.10"
+serde_json = "1"
+sdl3 = { version = "0.14", optional = true }
+
+[profile.release]
+opt-level = 3
+debug = false

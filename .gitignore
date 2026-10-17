@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Outputs
+*.glb
+/report/
+/out/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
