@@ -919,7 +919,9 @@ fn estimate_one(views: &[View], cfg: &Config) -> Solution {
         let a = g.o;
         (a, [a[0] + g.n[0] as f32 * g.v, a[1] + g.n[1] as f32 * g.v, a[2] + g.n[2] as f32 * g.v])
     } else {
-        let m = 1.5 * g.v;
+        let ext = [(hi[0] - lo[0] + 1) as f32, (hi[1] - lo[1] + 1) as f32, (hi[2] - lo[2] + 1) as f32];
+        // room around the hull: thin parts the strict intersection loses must still fit in the grid
+        let m = (1.5 * g.v).max(0.08 * g.v * ext.iter().cloned().fold(0.0, f32::max));
         (
             [g.o[0] + lo[0] as f32 * g.v - m, g.o[1] + lo[1] as f32 * g.v - m, g.o[2] + lo[2] as f32 * g.v - m],
             [g.o[0] + (hi[0] + 1) as f32 * g.v + m, g.o[1] + (hi[1] + 1) as f32 * g.v + m, g.o[2] + (hi[2] + 1) as f32 * g.v + m],

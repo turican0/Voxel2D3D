@@ -52,6 +52,11 @@ Viewer: drag = rotate, wheel = zoom, space = auto-rotate, `R` = reset, `Esc` = q
    image are nudged by the smallest displacement (`--nudge`, default 3 px, penalised, smooth).
 4. **The same again with full colours** on the corrected images (stage 1 used 8 posterised colours).
 
+5. **Reconstruction:** evidence on a tight grid, small holes closed (gaps wider than 2 voxels, e.g.
+   between the legs, stay open), then a *coverage repair*: every silhouette pixel the model does
+   not explain gets the most probable voxel along its ray (only near the existing model). Colours
+   come from the best-facing view, not a blend. `--no-repair` switches the repair off.
+
 `--no-stages` runs a single pass, `--no-markers` skips the marker seeding.
 
 ## How it works

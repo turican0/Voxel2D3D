@@ -21,7 +21,7 @@ impl VoxelModel {
 /// `voxel`: voxel edge in world units (1 world unit = 1 pixel of the reference scale).
 /// `fine_y`: optional range of the model height (fractions 0..1 from the bottom) that is
 /// evaluated with half the voxel size (2x resolution), e.g. the legs.
-pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool, fine_y: Option<(f32, f32)>) -> VoxelModel {
+pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool, fine_y: Option<(f32, f32)>, repair: bool) -> VoxelModel {
     let (lo, hi) = sol.bounds;
     let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
     let longest = ext.iter().cloned().fold(0.0, f32::max);
@@ -46,11 +46,22 @@ pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolutio
     let mut occ: Vec<bool> = total.iter().map(|&t| t > sol.noise.thr).collect();
     let mut grid = grid;
     if let Some((a, b)) = fine_y {
-        let (g2, o2) = refine_region(views, &cams, sol, &grid, &occ, a, b);
+        let (g2, o2, t2) = refine_region(views, &cams, sol, &grid, &occ, a, b);
         grid = g2;
         occ = o2;
+        total = t2;
     }
+    // the strict intersection first loses floating fragments, then the repair brings back
+    // what the silhouettes demand (the repaired voxels are kept even when thin / detached)
     keep_largest_component(&mut occ, &grid);
+    close_holes(&mut occ, &grid, 1);
+    if repair {
+        let margin: f32 = std::env::var("VOX_REPAIR_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0);
+        let added = repair_coverage(views, &cams, &grid, &total, &mut occ, sol.noise.thr, margin, 2);
+        if added > 0 {
+            eprintln!("coverage repair: {added} voxels added so that every silhouette pixel is explained");
+        }
+    }
 
     let color = if colors { transfer_colors(views, &cams, &grid, &occ) } else { vec![[200, 200, 200]; grid.len()] };
     VoxelModel { grid, occ, color }
@@ -58,7 +69,7 @@ pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolutio
 
 /// Re-evaluates the evidence with half the voxel size inside a height range; elsewhere the
 /// coarse decision is simply copied to the finer lattice.
-fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[bool], a: f32, b: f32) -> (Grid, Vec<bool>) {
+fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[bool], a: f32, b: f32) -> (Grid, Vec<bool>, Vec<f32>) {
     let [nx, ny, nz] = g.n;
     let (mut ylo, mut yhi) = (usize::MAX, 0usize);
     for z in 0..nz {
@@ -73,7 +84,7 @@ fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[
     }
     let g2 = Grid { n: [nx * 2, ny * 2, nz * 2], v: g.v * 0.5, o: g.o };
     if ylo == usize::MAX {
-        return (g2, vec![false; g2.len()]);
+        return (g2, vec![false; g2.len()], vec![0.0; g2.len()]);
     }
     let slab = g2.n[0] * g2.n[1];
     let mut total = vec![0f32; g2.len()];
@@ -94,7 +105,150 @@ fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[
             }
         }
     }
-    (g2, out)
+    (g2, out, total)
+}
+
+/// Silhouette of an occupancy grid in one view (image sized).
+fn occ_mask(grid: &Grid, occ: &[bool], cam: &Cam, w: usize, h: usize) -> Vec<bool> {
+    let b = basis(cam.yaw, cam.pitch, cam.vs);
+    let mut out = vec![false; w * h];
+    let r = (grid.v * cam.scale * 0.55).max(0.6);
+    for z in 0..grid.n[2] {
+        for y in 0..grid.n[1] {
+            for x in 0..grid.n[0] {
+                if !occ[grid.idx(x, y, z)] {
+                    continue;
+                }
+                let [px, py] = cam.project(&b, grid.center(x, y, z));
+                for yy in (py - r).floor() as i32..(py + r).ceil() as i32 {
+                    for xx in (px - r).floor() as i32..(px + r).ceil() as i32 {
+                        if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                            out[yy as usize * w + xx as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every pixel of an input silhouette that the model does not explain gets the most
+/// probable voxel along its viewing ray (highest evidence, but not worse than `margin`
+/// below the occupancy threshold). This brings back thin parts (arms, cloth, tips) that
+/// the strict intersection of all silhouettes loses because of small drawing errors.
+fn repair_coverage(views: &[View], cams: &[Cam], g: &Grid, total: &[f32], occ: &mut [bool], thr: f32, margin: f32, rounds: usize) -> usize {
+    let mut added = 0usize;
+    // only voxels close to the existing model qualify: no ghosts floating at a wrong depth
+    let near = dilate(occ, g, 3);
+    let diag = ((g.n[0] * g.n[0] + g.n[1] * g.n[1] + g.n[2] * g.n[2]) as f32).sqrt() * g.v;
+    let centre = [g.o[0] + g.n[0] as f32 * g.v * 0.5, g.o[1] + g.n[1] as f32 * g.v * 0.5, g.o[2] + g.n[2] as f32 * g.v * 0.5];
+    for _ in 0..rounds {
+        for (k, view) in views.iter().enumerate() {
+            let cam = &cams[k];
+            let b = basis(cam.yaw, cam.pitch, cam.vs);
+            let model = occ_mask(g, occ, cam, view.w, view.h);
+            let mut todo: Vec<(f32, f32)> = Vec::new();
+            for y in 0..view.h {
+                for x in 0..view.w {
+                    let i = y * view.w + x;
+                    if view.sd[i] > 0.5 && !model[i] {
+                        todo.push((x as f32 + 0.5, y as f32 + 0.5));
+                    }
+                }
+            }
+            // ray: p = a*r + (b/vs)*u0 + t*c  with u0 the unstretched up vector
+            let found: Vec<Option<usize>> = todo
+                .par_iter()
+                .map(|&(px, py)| {
+                    let a = (px - cam.off[0]) / cam.scale;
+                    let bb = (cam.off[1] - py) / cam.scale / cam.vs;
+                    let u0 = [b.u[0] / cam.vs, b.u[1] / cam.vs, b.u[2] / cam.vs];
+                    let p0 = [a * b.r[0] + bb * u0[0], a * b.r[1] + bb * u0[1], a * b.r[2] + bb * u0[2]];
+                    // start at the point of the ray closest to the grid centre
+                    let t0 = (centre[0] - p0[0]) * b.c[0] + (centre[1] - p0[1]) * b.c[1] + (centre[2] - p0[2]) * b.c[2];
+                    let step = g.v * 0.5;
+                    let n = (diag / step) as i32;
+                    let (mut best, mut best_i) = (f32::NEG_INFINITY, None);
+                    for s in -n..=n {
+                        let t = t0 + s as f32 * step;
+                        let p = [p0[0] + t * b.c[0], p0[1] + t * b.c[1], p0[2] + t * b.c[2]];
+                        let (fx, fy, fz) = ((p[0] - g.o[0]) / g.v, (p[1] - g.o[1]) / g.v, (p[2] - g.o[2]) / g.v);
+                        if fx < 0.0 || fy < 0.0 || fz < 0.0 {
+                            continue;
+                        }
+                        let (ix, iy, iz) = (fx as usize, fy as usize, fz as usize);
+                        if ix >= g.n[0] || iy >= g.n[1] || iz >= g.n[2] {
+                            continue;
+                        }
+                        let idx = g.idx(ix, iy, iz);
+                        if near[idx] && total[idx] > best {
+                            best = total[idx];
+                            best_i = Some(idx);
+                        }
+                    }
+                    if best > thr - margin {
+                        best_i
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for f in found.into_iter().flatten() {
+                if !occ[f] {
+                    occ[f] = true;
+                    added += 1;
+                }
+            }
+        }
+    }
+    added
+}
+
+/// Cube dilation (max filter) of radius `r` voxels, separable.
+fn dilate(occ: &[bool], g: &Grid, r: usize) -> Vec<bool> {
+    let [nx, ny, nz] = g.n;
+    let mut cur = occ.to_vec();
+    for axis in 0..3 {
+        let mut next = vec![false; cur.len()];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let c = [x, y, z];
+                    let n = g.n[axis];
+                    let lo = c[axis].saturating_sub(r);
+                    let hi = (c[axis] + r).min(n - 1);
+                    let mut v = false;
+                    for t in lo..=hi {
+                        let mut q = c;
+                        q[axis] = t;
+                        if cur[g.idx(q[0], q[1], q[2])] {
+                            v = true;
+                            break;
+                        }
+                    }
+                    next[g.idx(x, y, z)] = v;
+                }
+            }
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn erode(occ: &[bool], g: &Grid, r: usize) -> Vec<bool> {
+    let inv: Vec<bool> = occ.iter().map(|&o| !o).collect();
+    dilate(&inv, g, r).into_iter().map(|d| !d).collect()
+}
+
+/// Morphological closing: small holes (pixel-level misregistration) are filled, gaps wider
+/// than 2r voxels (between the legs) stay open.
+fn close_holes(occ: &mut [bool], g: &Grid, r: usize) {
+    let d = dilate(occ, g, r);
+    let c = erode(&d, g, r);
+    for i in 0..occ.len() {
+        occ[i] = occ[i] || c[i];
+    }
 }
 
 fn keep_largest_component(occ: &mut [bool], g: &Grid) {
@@ -252,7 +406,7 @@ fn transfer_colors(views: &[View], cams: &[Cam], g: &Grid, occ: &[bool]) -> Vec<
                         Some(n) => (n[0] * b.c[0] + n[1] * b.c[1] + n[2] * b.c[2]).max(0.0),
                         None => 1.0,
                     };
-                    let w = edge * (facing * facing * facing * facing + 1e-3);
+                    let w = edge * (facing.powi(12) + 1e-4);
                     let c = views[k].color_at(px, py);
                     for d in 0..3 {
                         acc[d] += w * c[d] as f32;

@@ -55,6 +55,8 @@ CAMERA / ALIGNMENT
                              typical for mirrored sprite sheets; 360 = full circle)
         --yaw-dev DEG        each image's angle is searched separately within this window around
                              the starting estimate from the markers (default 10)
+        --no-repair          do not add voxels for silhouette pixels the strict intersection loses
+                             (thin parts: arms, cloth, tips)
         --fine-y A,B         evaluate this part of the model height (fractions 0..1 from the bottom,
                              e.g. 0.1,0.55 for the legs) with 2x the resolution
         --nudge PX           largest shift when parts of an image are nudged to fit (default 3)
@@ -102,6 +104,7 @@ struct Opts {
     free_angles: bool,
     no_markers: bool,
     stages: bool,
+    repair: bool,
     fine_y: Option<(f32, f32)>,
     nudge: f32,
     yaw_dev: f32,
@@ -138,6 +141,7 @@ fn parse_args() -> Result<Opts, String> {
         free_angles: false,
         no_markers: false,
         stages: true,
+        repair: true,
         fine_y: None,
         nudge: 3.0,
         yaw_dev: 10.0,
@@ -180,6 +184,7 @@ fn parse_args() -> Result<Opts, String> {
             "--color-weight" => o.color_weight = num(&mut it, "--color-weight")?,
             "--no-markers" => o.no_markers = true,
             "--no-stages" => o.stages = false,
+            "--no-repair" => o.repair = false,
             "--fine-y" => {
                 let v = it.next().ok_or("--fine-y needs a value like 0.1,0.55")?;
                 let p: Vec<&str> = v.split(',').collect();
@@ -368,7 +373,7 @@ fn run() -> Result<(), String> {
     let mut views = views;
     if o.stages {
         // ---- stage 2: coarse model -> where does it not fit? -> nudge the images by the minimum
-        let coarse = carve::reconstruct(&views, &sol, None, 64, true, None);
+        let coarse = carve::reconstruct(&views, &sol, None, 64, true, None, false);
         let mut nudged = Vec::with_capacity(views.len());
         for k in 0..views.len() {
             let rend = refine::render_model(&coarse, &views[k], &sol.cam(k));
@@ -403,7 +408,7 @@ fn run() -> Result<(), String> {
     }
     let views = views;
 
-    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors, o.fine_y);
+    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors, o.fine_y, o.repair);
     let g = model.grid;
     if !o.quiet {
         eprintln!("voxel grid {}x{}x{} (voxel {:.2} px), {} occupied voxels", g.n[0], g.n[1], g.n[2], g.v, model.count());
@@ -456,6 +461,15 @@ fn write_report(dir: &Path, views: &[View], sol: &estimate::Solution, model: &Vo
         let cam = sol.cam(k);
         let mm = carve::project_mask(model, v, &cam);
         let iou = carve::iou(&v.mask, &mm);
+        let (mut inter, mut a_cnt, mut b_cnt) = (0usize, 0usize, 0usize);
+        for i in 0..v.mask.len() {
+            if v.mask[i] && mm[i] {
+                inter += 1;
+            }
+            a_cnt += v.mask[i] as usize;
+            b_cnt += mm[i] as usize;
+        }
+        let (recall, precision) = (inter as f32 / a_cnt.max(1) as f32, inter as f32 / b_cnt.max(1) as f32);
         let mut img = image::RgbImage::new(v.w as u32, v.h as u32);
         for y in 0..v.h {
             for x in 0..v.w {
@@ -499,6 +513,8 @@ fn write_report(dir: &Path, views: &[View], sol: &estimate::Solution, model: &Vo
             "anchor_px": [sol.anchors[k][0] + sol.poses[k].shift[0], sol.anchors[k][1] + sol.poses[k].shift[1]],
             "iou_estimate": sol.ious[k],
             "iou_final": iou,
+            "recall": recall,
+            "precision": precision,
         }));
     }
     let rep = serde_json::json!({ "pitch": sol.pitch, "vscale": sol.vscale, "score": sol.score, "views": rows });
