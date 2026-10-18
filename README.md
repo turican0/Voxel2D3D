@@ -28,6 +28,7 @@ voxel2d3d frames/*.png -o model.glb --report report/        # fully automatic
 voxel2d3d frames/*.png --span 180 -o model.glb              # images cover a half circle evenly
 voxel2d3d frames/*.png --yaw-step 25.714 -o model.glb       # step between images known
 voxel2d3d frames/*.png --angles angles.txt --pitch 30       # yaws (and pitch) known
+voxel2d3d frames/*.png --fine-y 0.1,0.55 -o model.glb       # legs (10-55 % of the height) at 2x resolution
 voxel2d3d frames/*.png -o model.glb --view                  # open the SDL3 preview
 ```
 

@@ -19,7 +19,9 @@ impl VoxelModel {
 }
 
 /// `voxel`: voxel edge in world units (1 world unit = 1 pixel of the reference scale).
-pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool) -> VoxelModel {
+/// `fine_y`: optional range of the model height (fractions 0..1 from the bottom) that is
+/// evaluated with half the voxel size (2x resolution), e.g. the legs.
+pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool, fine_y: Option<(f32, f32)>) -> VoxelModel {
     let (lo, hi) = sol.bounds;
     let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
     let longest = ext.iter().cloned().fold(0.0, f32::max);
@@ -42,10 +44,57 @@ pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolutio
         }
     });
     let mut occ: Vec<bool> = total.iter().map(|&t| t > sol.noise.thr).collect();
+    let mut grid = grid;
+    if let Some((a, b)) = fine_y {
+        let (g2, o2) = refine_region(views, &cams, sol, &grid, &occ, a, b);
+        grid = g2;
+        occ = o2;
+    }
     keep_largest_component(&mut occ, &grid);
 
     let color = if colors { transfer_colors(views, &cams, &grid, &occ) } else { vec![[200, 200, 200]; grid.len()] };
     VoxelModel { grid, occ, color }
+}
+
+/// Re-evaluates the evidence with half the voxel size inside a height range; elsewhere the
+/// coarse decision is simply copied to the finer lattice.
+fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[bool], a: f32, b: f32) -> (Grid, Vec<bool>) {
+    let [nx, ny, nz] = g.n;
+    let (mut ylo, mut yhi) = (usize::MAX, 0usize);
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                if occ[g.idx(x, y, z)] {
+                    ylo = ylo.min(y);
+                    yhi = yhi.max(y);
+                }
+            }
+        }
+    }
+    let g2 = Grid { n: [nx * 2, ny * 2, nz * 2], v: g.v * 0.5, o: g.o };
+    if ylo == usize::MAX {
+        return (g2, vec![false; g2.len()]);
+    }
+    let slab = g2.n[0] * g2.n[1];
+    let mut total = vec![0f32; g2.len()];
+    total.par_chunks_mut(slab).enumerate().for_each(|(iz, chunk)| {
+        for (k, view) in views.iter().enumerate() {
+            llr_slab(view, LEVELS - 1, &cams[k], &g2, iz, &sol.noise, chunk, true);
+        }
+    });
+    let span = (yhi - ylo + 1) as f32;
+    let mut out = vec![false; g2.len()];
+    for z in 0..g2.n[2] {
+        for y in 0..g2.n[1] {
+            let frac = ((y / 2) as f32 + 0.5 - ylo as f32) / span;
+            let fine = frac >= a && frac <= b;
+            for x in 0..g2.n[0] {
+                let i = g2.idx(x, y, z);
+                out[i] = if fine { total[i] > sol.noise.thr } else { occ[g.idx(x / 2, y / 2, z / 2)] };
+            }
+        }
+    }
+    (g2, out)
 }
 
 fn keep_largest_component(occ: &mut [bool], g: &Grid) {

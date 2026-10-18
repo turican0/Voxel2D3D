@@ -55,6 +55,8 @@ CAMERA / ALIGNMENT
                              typical for mirrored sprite sheets; 360 = full circle)
         --yaw-dev DEG        each image's angle is searched separately within this window around
                              the starting estimate from the markers (default 10)
+        --fine-y A,B         evaluate this part of the model height (fractions 0..1 from the bottom,
+                             e.g. 0.1,0.55 for the legs) with 2x the resolution
         --nudge PX           largest shift when parts of an image are nudged to fit (default 3)
         --no-stages          single pass (no coarse model / nudging / full-colour repeat)
         --no-markers         do not use colour markers for the starting angles
@@ -98,6 +100,7 @@ struct Opts {
     free_angles: bool,
     no_markers: bool,
     stages: bool,
+    fine_y: Option<(f32, f32)>,
     nudge: f32,
     yaw_dev: f32,
     yaw_step: Option<f32>,
@@ -133,6 +136,7 @@ fn parse_args() -> Result<Opts, String> {
         free_angles: false,
         no_markers: false,
         stages: true,
+        fine_y: None,
         nudge: 3.0,
         yaw_dev: 10.0,
         yaw_step: None,
@@ -174,6 +178,16 @@ fn parse_args() -> Result<Opts, String> {
             "--color-weight" => o.color_weight = num(&mut it, "--color-weight")?,
             "--no-markers" => o.no_markers = true,
             "--no-stages" => o.stages = false,
+            "--fine-y" => {
+                let v = it.next().ok_or("--fine-y needs a value like 0.1,0.55")?;
+                let p: Vec<&str> = v.split(',').collect();
+                if p.len() != 2 {
+                    return Err("--fine-y: expected A,B".into());
+                }
+                let a: f32 = p[0].parse().map_err(|_| "--fine-y: invalid number")?;
+                let b: f32 = p[1].parse().map_err(|_| "--fine-y: invalid number")?;
+                o.fine_y = Some((a, b));
+            }
             "--nudge" => o.nudge = num(&mut it, "--nudge")?,
             "--free-angles" => o.free_angles = true,
             "--span" => {
@@ -348,7 +362,7 @@ fn run() -> Result<(), String> {
     let mut views = views;
     if o.stages {
         // ---- stage 2: coarse model -> where does it not fit? -> nudge the images by the minimum
-        let coarse = carve::reconstruct(&views, &sol, None, 64, true);
+        let coarse = carve::reconstruct(&views, &sol, None, 64, true, None);
         let mut nudged = Vec::with_capacity(views.len());
         for k in 0..views.len() {
             let rend = refine::render_model(&coarse, &views[k], &sol.cam(k));
@@ -383,7 +397,7 @@ fn run() -> Result<(), String> {
     }
     let views = views;
 
-    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors);
+    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors, o.fine_y);
     let g = model.grid;
     if !o.quiet {
         eprintln!("voxel grid {}x{}x{} (voxel {:.2} px), {} occupied voxels", g.n[0], g.n[1], g.n[2], g.v, model.count());
