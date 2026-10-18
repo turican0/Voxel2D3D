@@ -20,11 +20,26 @@
 //! from several yaw layouts (full circle / half circle, both rotation directions).
 
 use crate::model::*;
+use crate::markers::{marker_loss, Track};
 use crate::silhouette::View;
 use rayon::prelude::*;
 
+/// Starting point from the marker calibration.
+#[derive(Clone, Debug)]
+pub struct Init {
+    pub yaw: Vec<f32>,
+    pub pitch: f32,
+    pub vs: f32,
+    /// pixel position of the world origin per view
+    pub off: Vec<[f32; 2]>,
+    /// marker tracks (angle evidence); may be empty
+    pub tracks: Vec<Track>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub inits: Vec<Init>,
+    pub init: Option<Init>,
     pub e: f32,
     pub q: f32,
     pub prior: f32,
@@ -51,6 +66,8 @@ pub struct Config {
 impl Config {
     pub fn new(n_views: usize) -> Self {
         Self {
+            inits: vec![],
+            init: None,
             e: 0.04,
             q: 0.35,
             prior: 0.5,
@@ -126,6 +143,8 @@ struct Problem<'a> {
     lam_s: f32,
     lam_a: f32,
     lam_c: f32,
+    tracks: Vec<Track>,
+    lam_m: f32,
     yaw_window: Option<f32>,
     vs: f32,
     pmin: f32,
@@ -159,6 +178,7 @@ impl<'a> Problem<'a> {
         noise: Noise,
         lam_s: f32,
         lam_c: f32,
+        tracks: Vec<Track>,
         yaw_window: Option<f32>,
         vs: f32,
         (pmin, pmax): (f32, f32),
@@ -188,8 +208,10 @@ impl<'a> Problem<'a> {
             max_shift: max_shift.to_vec(),
             noise,
             lam_s,
-            lam_a: if yaw_window.is_some() { 0.03 } else { 0.01 },
+            lam_a: if yaw_window.is_some() { 0.05 } else { 0.01 },
             lam_c,
+            lam_m: 0.04,
+            tracks,
             yaw_window,
             vs,
             pmin,
@@ -410,7 +432,12 @@ impl<'a> Problem<'a> {
                 color_cost = f * mean_std + (1.0 - f) * 0.25;
             }
         }
-        (mean - self.penalty(poses) - self.lam_c * color_cost, ious)
+        let mut marker_pen = 0.0;
+        if !self.tracks.is_empty() {
+            let yaws: Vec<f32> = poses.iter().map(|p| p.yaw).collect();
+            marker_pen = self.lam_m * marker_loss(&self.tracks, k_n, &self.scales, &yaws, pitch, self.vs);
+        }
+        (mean - self.penalty(poses) - self.lam_c * color_cost - marker_pen, ious)
     }
 
     fn build_cache(&self, poses: &[Pose], pitch: f32) -> Cache {
@@ -685,7 +712,29 @@ impl<'a> Problem<'a> {
     }
 }
 
+/// Runs the optimisation from every calibration candidate (or from scratch when there is
+/// none) and returns the solution with the best final score.
 pub fn estimate(views: &[View], cfg: &Config) -> Solution {
+    if cfg.inits.is_empty() {
+        return estimate_one(views, cfg);
+    }
+    let mut best: Option<Solution> = None;
+    for (i, init) in cfg.inits.iter().enumerate() {
+        let mut c = cfg.clone();
+        c.inits.clear();
+        c.init = Some(init.clone());
+        if cfg.verbose {
+            eprintln!("calibration candidate {}/{}", i + 1, cfg.inits.len());
+        }
+        let sol = estimate_one(views, &c);
+        if best.as_ref().map_or(true, |b| sol.score > b.score) {
+            best = Some(sol);
+        }
+    }
+    best.unwrap()
+}
+
+fn estimate_one(views: &[View], cfg: &Config) -> Solution {
     let k_n = views.len();
     assert!(k_n >= 2, "at least two images are required");
 
@@ -697,7 +746,10 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
     } else {
         vec![1.0; k_n]
     };
-    let anchors: Vec<[f32; 2]> = (0..k_n).map(|k| cfg.anchors[k].unwrap_or_else(|| views[k].bbox_center())).collect();
+    let anchors: Vec<[f32; 2]> = match &cfg.init {
+        Some(i) => i.off.clone(),
+        None => (0..k_n).map(|k| cfg.anchors[k].unwrap_or_else(|| views[k].bbox_center())).collect(),
+    };
     let max_shift: Vec<f32> = (0..k_n)
         .map(|k| cfg.max_shift.unwrap_or_else(|| 0.25 * views[k].bbox_w().max(views[k].bbox_h())))
         .collect();
@@ -709,9 +761,9 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
 
     let max_dim = views.iter().zip(&scales).map(|(v, s)| v.bbox_w().max(v.bbox_h()) / s).fold(0.0, f32::max);
     let pitch_fixed = cfg.pitch.is_some();
-    let pitch0 = cfg.pitch.unwrap_or(30.0f32.clamp(cfg.pitch_min, cfg.pitch_max));
+    let pitch0 = cfg.pitch.or(cfg.init.as_ref().map(|i| i.pitch)).unwrap_or(30.0f32.clamp(cfg.pitch_min, cfg.pitch_max));
     let vs_fixed = cfg.vscale.is_some();
-    let vs0 = cfg.vscale.unwrap_or(1.0);
+    let vs0 = cfg.vscale.or(cfg.init.as_ref().map(|i| i.vs)).unwrap_or(1.0);
     let prange = (cfg.pitch_min, cfg.pitch_max);
 
     // ---- candidate yaw layouts
@@ -723,7 +775,9 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
             layouts.push(y);
         }
     };
-    if all_hinted {
+    if let Some(i) = &cfg.init {
+        layouts.push(i.yaw.clone());
+    } else if all_hinted {
         layouts.push((0..k_n).map(hint_or0).collect());
     } else if cfg.turntable {
         let mut steps: Vec<f32> = vec![10.0, 12.0, 15.0, 18.0, 20.0, 22.5, 25.0, 30.0, 36.0, 45.0, 60.0, 90.0];
@@ -751,9 +805,9 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
             }
         }
     }
-    let window = if cfg.turntable && !all_hinted { Some(cfg.yaw_dev) } else { None };
+    let window = if cfg.init.is_some() { Some(cfg.yaw_dev) } else if cfg.turntable && !all_hinted { Some(cfg.yaw_dev) } else { None };
     let mk = |yaws: &[f32], vs: f32, voxel: f32, level: usize| {
-        Problem::new(views, &scales, &anchors, &max_shift, noise, cfg.shift_penalty, cfg.color_weight, window, vs, prange, yaws.to_vec(), hinted.clone(), voxel, level)
+        Problem::new(views, &scales, &anchors, &max_shift, noise, cfg.shift_penalty, cfg.color_weight, cfg.init.as_ref().map(|i| i.tracks.clone()).unwrap_or_default(), window, vs, prange, yaws.to_vec(), hinted.clone(), voxel, level)
     };
     let signed_step = |y: &[f32]| -> f32 {
         let d = (y[1.min(k_n - 1)] - y[0]).rem_euclid(360.0);
@@ -781,7 +835,7 @@ pub fn estimate(views: &[View], cfg: &Config) -> Solution {
 
     // ---- every promising layout goes through the whole pipeline; the best final score wins
     //      (the cheap ranking above is too coarse to trust on its own)
-    let vs_cands: Vec<f32> = if vs_fixed { vec![vs0] } else { vec![0.6, 0.8, 0.9, 1.0, 1.15, 1.3, 1.5] };
+    let vs_cands: Vec<f32> = if vs_fixed || cfg.init.is_some() { vec![vs0] } else { vec![0.6, 0.8, 0.9, 1.0, 1.15, 1.3, 1.5] };
     let mut best: Option<(f32, Vec<Pose>, f32, f32, Vec<f32>)> = None;
     for (n, &(_, p0, i)) in ranked.iter().take(top).enumerate() {
         let yaws = &layouts[i];

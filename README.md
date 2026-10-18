@@ -40,6 +40,19 @@ PNG per input: grey = input and model agree, red = only in the input, blue = onl
 
 Viewer: drag = rotate, wheel = zoom, space = auto-rotate, `R` = reset, `Esc` = quit.
 
+## Pipeline (stages)
+
+1. **Angles first.** Colour regions (markers) are tracked from view to view; the tracks give a
+   starting estimate of every yaw, the pitch and the position of the rotation axis in each cropped
+   image. Then the angle of **every image is searched separately** (window `--yaw-dev`, default
+   10 deg) with silhouettes, colour consistency and the marker residual as the score.
+2. **Coarse model** is carved from the silhouettes.
+3. **Deviations.** The model is rendered into every view; where it does not fit, parts of the
+   image are nudged by the smallest displacement (`--nudge`, default 3 px, penalised, smooth).
+4. **The same again with full colours** on the corrected images (stage 1 used 8 posterised colours).
+
+`--no-stages` runs a single pass, `--no-markers` skips the marker seeding.
+
 ## How it works
 
 1. **Silhouettes.** Alpha channel or background colour (Otsu), holes filled, specks removed.

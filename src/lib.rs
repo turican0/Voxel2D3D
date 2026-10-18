@@ -4,7 +4,9 @@
 
 pub mod carve;
 pub mod estimate;
+pub mod markers;
 pub mod mesh;
+pub mod refine;
 pub mod model;
 pub mod silhouette;
 

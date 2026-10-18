@@ -16,6 +16,8 @@ pub struct View {
     pub name: String,
     pub w: usize,
     pub h: usize,
+    /// the source image (needed to rebuild the view after small corrections)
+    pub rgba: image::RgbaImage,
     pub rgb: Vec<[u8; 3]>,
     /// Colours in 0..1, lightly blurred inside the silhouette (used for photo-consistency).
     pub col: Vec<[f32; 3]>,
@@ -138,9 +140,15 @@ impl View {
 
 pub fn load_view(path: &Path, opt: &LoadOptions) -> Result<View, String> {
     let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.to_rgba8();
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    build_view(name, img, opt).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Builds all derived maps (silhouette, distance field, probabilities, colours) from an image.
+pub fn build_view(name: String, img: image::RgbaImage, opt: &LoadOptions) -> Result<View, String> {
     let w = img.width() as usize;
     let h = img.height() as usize;
-    let px = img.as_raw();
+    let px = img.as_raw().clone();
     let n = w * h;
 
     let rgb: Vec<[u8; 3]> = (0..n).map(|i| [px[i * 4], px[i * 4 + 1], px[i * 4 + 2]]).collect();
@@ -201,7 +209,7 @@ pub fn load_view(path: &Path, opt: &LoadOptions) -> Result<View, String> {
         }
     }
     if x1 == 0 {
-        return Err(format!("{}: no silhouette found (empty mask)", path.display()));
+        return Err("no silhouette found (empty mask)".to_string());
     }
 
     // signed distance
@@ -245,8 +253,7 @@ pub fn load_view(path: &Path, opt: &LoadOptions) -> Result<View, String> {
         }
     }
 
-    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    Ok(View { name, w, h, rgb, col, mask, sd, pins, bbox: [x0, y0, x1, y1] })
+    Ok(View { name, w, h, rgba: img.clone(), rgb, col, mask, sd, pins, bbox: [x0, y0, x1, y1] })
 }
 
 /// Otsu threshold on a 0..255 histogram of the (clamped) values.

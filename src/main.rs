@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use voxel2d3d::carve::{self, VoxelModel};
 use voxel2d3d::estimate::{self, Config};
+use voxel2d3d::markers;
 use voxel2d3d::mesh;
+use voxel2d3d::refine;
 use voxel2d3d::silhouette::{self, LoadOptions, View};
 
 const HELP: &str = "\
@@ -51,7 +53,11 @@ CAMERA / ALIGNMENT
                              180 degrees); both rotation directions are still tried
         --span DEG           the images evenly cover this angle, first to last (180 = half circle,
                              typical for mirrored sprite sheets; 360 = full circle)
-        --yaw-dev DEG        largest deviation of an image from the even spacing (default 8)
+        --yaw-dev DEG        each image's angle is searched separately within this window around
+                             the starting estimate from the markers (default 10)
+        --nudge PX           largest shift when parts of an image are nudged to fit (default 3)
+        --no-stages          single pass (no coarse model / nudging / full-colour repeat)
+        --no-markers         do not use colour markers for the starting angles
         --normalize-height   scale every image so the silhouette heights match
                              (for drawings made at different zoom levels)
 
@@ -90,6 +96,9 @@ struct Opts {
     color_weight: f32,
     normalize: bool,
     free_angles: bool,
+    no_markers: bool,
+    stages: bool,
+    nudge: f32,
     yaw_dev: f32,
     yaw_step: Option<f32>,
     span: Option<f32>,
@@ -122,7 +131,10 @@ fn parse_args() -> Result<Opts, String> {
         color_weight: 1.0,
         normalize: false,
         free_angles: false,
-        yaw_dev: 8.0,
+        no_markers: false,
+        stages: true,
+        nudge: 3.0,
+        yaw_dev: 10.0,
         yaw_step: None,
         span: None,
         e: 0.04,
@@ -160,6 +172,9 @@ fn parse_args() -> Result<Opts, String> {
             "--max-shift" => o.max_shift = Some(num(&mut it, "--max-shift")?),
             "--shift-penalty" => o.shift_penalty = num(&mut it, "--shift-penalty")?,
             "--color-weight" => o.color_weight = num(&mut it, "--color-weight")?,
+            "--no-markers" => o.no_markers = true,
+            "--no-stages" => o.stages = false,
+            "--nudge" => o.nudge = num(&mut it, "--nudge")?,
             "--free-angles" => o.free_angles = true,
             "--span" => {
                 let span: f32 = num(&mut it, "--span")?;
@@ -287,21 +302,86 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // ---- marker based calibration (angles, pitch, image offsets)
+    let mut calib: Option<markers::Calib> = None;
+    if !o.no_markers {
+        let tracks = markers::extract_tracks(&views, 12);
+        if !o.quiet {
+            eprintln!("markers: {} tracks found", tracks.len());
+        }
+        let step = cfg.yaw_step.or_else(|| o.span.map(|sp| if sp >= 360.0 { sp / views.len() as f32 } else { sp / (views.len() as f32 - 1.0) }));
+        let copt = markers::CalibOptions { pitch: o.pitch, vs: o.vscale, yaw_hints: cfg.yaw_hints.clone(), step, turntable: !o.free_angles, yaw_dev: o.yaw_dev, verbose: !o.quiet, max_candidates: 4 };
+        let scales = vec![1.0f32; views.len()];
+        let cands = markers::calibrate(&views, &tracks, &scales, &copt);
+        // candidates whose markers fit much worse than the best one are not worth a full run
+        let best_rms = cands.first().map_or(0.0, |c| c.rms);
+        let mut cands: Vec<markers::Calib> = cands.into_iter().filter(|c| c.rms <= 1.5 * best_rms + 0.3).collect();
+        if best_rms > 3.0 {
+            if !o.quiet {
+                eprintln!("  markers do not agree well enough ({:.1} px) - not used, searching without them", best_rms);
+            }
+            cands.clear();
+        }
+        for c in &cands {
+            if !o.quiet {
+                eprintln!("  marker yaws: {:?}", c.yaw.iter().map(|y| (y * 10.0).round() / 10.0).collect::<Vec<_>>());
+            }
+            cfg.inits.push(estimate::Init { yaw: c.yaw.clone(), pitch: c.pitch, vs: c.vs, off: c.off.clone(), tracks: c.tracks.clone() });
+        }
+        if !cands.is_empty() {
+            calib = cands.into_iter().next();
+            if cfg.max_shift.is_none() {
+                cfg.max_shift = Some(4.0);
+            }
+        }
+    }
+    let _ = &calib;
+
     if !o.quiet {
         eprintln!("estimating angles, pitch and image shifts ({} images)...", views.len());
     }
-    let sol = estimate::estimate(&views, &cfg);
+    // ---- stage 1: angles of every image, found separately (posterised colours: robust against shading)
+    let views_q = if o.stages { markers::quantize_views(&views, 8) } else { views.clone() };
+    let mut sol = estimate::estimate(&views_q, &cfg);
+    print_result(&views, &sol, o.quiet, "stage 1");
 
-    if !o.quiet {
-        eprintln!("\nresult (yaw 0 = camera on +Z; positive pitch = looking down):");
-        eprintln!("  pitch {:.1} deg, vertical scale {:.2}, score {:.4}", sol.pitch, sol.vscale, sol.score);
+    let mut views = views;
+    if o.stages {
+        // ---- stage 2: coarse model -> where does it not fit? -> nudge the images by the minimum
+        let coarse = carve::reconstruct(&views, &sol, None, 64, true);
+        let mut nudged = Vec::with_capacity(views.len());
         for k in 0..views.len() {
-            eprintln!(
-                "  {:<28} yaw {:6.1}  shift ({:+5.1}, {:+5.1}) px  IoU {:.3}",
-                views[k].name, sol.poses[k].yaw, sol.poses[k].shift[0], sol.poses[k].shift[1], sol.ious[k]
-            );
+            let rend = refine::render_model(&coarse, &views[k], &sol.cam(k));
+            let (field, st) = refine::deviation_field(&views[k], &rend, o.nudge, 0.05);
+            if !o.quiet {
+                eprintln!(
+                    "  deviations {:<26} {:>2}/{} cells moved, mean {:.2} px, max {:.2} px, error {:.4} -> {:.4}",
+                    views[k].name, st.moved_cells, st.cells, st.mean_shift, st.max_shift, st.err_before, st.err_after
+                );
+            }
+            nudged.push(refine::warp_view(&views[k], &field, &o.load)?);
         }
+        views = nudged;
+
+        // ---- stage 3: the same again with full colours, starting from the stage 1 result
+        let init = estimate::Init {
+            yaw: sol.poses.iter().map(|p| p.yaw).collect(),
+            pitch: sol.pitch,
+            vs: sol.vscale,
+            off: (0..views.len()).map(|k| [sol.anchors[k][0] + sol.poses[k].shift[0], sol.anchors[k][1] + sol.poses[k].shift[1]]).collect(),
+            tracks: vec![],
+        };
+        let mut cfg2 = cfg.clone();
+        cfg2.inits = vec![init];
+        cfg2.yaw_dev = cfg.yaw_dev.min(6.0);
+        cfg2.max_shift = Some(o.nudge.max(1.0));
+        if !o.quiet {
+            eprintln!("stage 3: repeating with full colours...");
+        }
+        sol = estimate::estimate(&views, &cfg2);
+        print_result(&views, &sol, o.quiet, "stage 3");
     }
+    let views = views;
 
     let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors);
     let g = model.grid;
@@ -335,6 +415,20 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn print_result(views: &[View], sol: &estimate::Solution, quiet: bool, tag: &str) {
+    if quiet {
+        return;
+    }
+    eprintln!("\nresult {tag} (yaw 0 = camera on +Z; positive pitch = looking down):");
+    eprintln!("  pitch {:.1} deg, vertical scale {:.2}, score {:.4}", sol.pitch, sol.vscale, sol.score);
+    for k in 0..views.len() {
+        eprintln!(
+            "  {:<28} yaw {:6.1}  shift ({:+5.1}, {:+5.1}) px  IoU {:.3}",
+            views[k].name, sol.poses[k].yaw, sol.poses[k].shift[0], sol.poses[k].shift[1], sol.ious[k]
+        );
+    }
+}
+
 fn write_report(dir: &Path, views: &[View], sol: &estimate::Solution, model: &VoxelModel) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut rows = Vec::new();
@@ -360,6 +454,24 @@ fn write_report(dir: &Path, views: &[View], sol: &estimate::Solution, model: &Vo
         }
         let stem = Path::new(&v.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         img.save(dir.join(format!("{stem}_overlay.png"))).map_err(|e| e.to_string())?;
+        // side by side: input | model rendered with the estimated camera (4x, nearest neighbour)
+        let rend = refine::render_model(model, v, &cam);
+        const S: usize = 4;
+        let mut cmp = image::RgbImage::from_pixel((v.w * S * 2 + 8) as u32, (v.h * S) as u32, image::Rgb([90, 120, 90]));
+        for y in 0..v.h * S {
+            for x in 0..v.w * S {
+                let i = (y / S) * v.w + x / S;
+                if v.mask[i] {
+                    let c = v.rgb[i];
+                    cmp.put_pixel(x as u32, y as u32, image::Rgb(c));
+                }
+                if rend.cov[i] {
+                    let c = rend.col[i];
+                    cmp.put_pixel((x + v.w * S + 8) as u32, y as u32, image::Rgb([(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8]));
+                }
+            }
+        }
+        cmp.save(dir.join(format!("{stem}_compare.png"))).map_err(|e| e.to_string())?;
         rows.push(serde_json::json!({
             "image": v.name,
             "yaw": sol.poses[k].yaw,
