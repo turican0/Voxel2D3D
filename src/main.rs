@@ -70,7 +70,9 @@ PROBABILITY MODEL
 
 SILHOUETTES
         --bg-threshold T     colour distance from the background colour (default: Otsu)
-        --keep-holes         do not fill enclosed background regions
+        --keep-holes         do not fill enclosed background regions (images without alpha)
+        --fill-holes         also fill enclosed transparent regions of images with alpha
+                             (by default transparent gaps, e.g. between the legs, stay open)
         --softness PX        edge softness of the sharpest probability map
 
     -q, --quiet              less output
@@ -202,6 +204,10 @@ fn parse_args() -> Result<Opts, String> {
             "--prior" => o.prior = num(&mut it, "--prior")?,
             "--bg-threshold" => o.load.bg_threshold = Some(num(&mut it, "--bg-threshold")?),
             "--keep-holes" => o.load.fill_holes = false,
+            "--fill-holes" => {
+                o.load.fill_holes = true;
+                o.load.fill_alpha_holes = true;
+            }
             "--softness" => o.load.softness = Some(num(&mut it, "--softness")?),
             "-q" | "--quiet" => o.quiet = true,
             s if s.starts_with('-') => return Err(format!("unknown option {s} (see --help)")),

@@ -33,14 +33,18 @@ pub struct View {
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub bg_threshold: Option<f32>,
+    /// Fill enclosed background regions (only for images WITHOUT an alpha channel: there a
+    /// light interior can be mistaken for background; with alpha the gaps are real).
     pub fill_holes: bool,
+    /// Also fill enclosed transparent regions of images with an alpha channel.
+    pub fill_alpha_holes: bool,
     /// Sharpest softness in pixels (None = automatic, ~0.8 % of the silhouette height).
     pub softness: Option<f32>,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { bg_threshold: None, fill_holes: true, softness: None }
+        Self { bg_threshold: None, fill_holes: true, fill_alpha_holes: false, softness: None }
     }
 }
 
@@ -191,7 +195,7 @@ pub fn build_view(name: String, img: image::RgbaImage, opt: &LoadOptions) -> Res
         }
     }
 
-    if opt.fill_holes {
+    if (use_alpha && opt.fill_alpha_holes) || (!use_alpha && opt.fill_holes) {
         fill_holes(&mut mask, w, h);
     }
     drop_small_components(&mut mask, w, h, 0.03);
