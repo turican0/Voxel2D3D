@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use voxel2d3d::carve::{self, VoxelModel};
 use voxel2d3d::estimate::{self, Config};
+use voxel2d3d::exchange;
 use voxel2d3d::markers;
 use voxel2d3d::mesh;
 use voxel2d3d::refine;
@@ -25,6 +26,20 @@ OUTPUT
                              (red = only input silhouette, blue = only model, grey = both)
         --view               open the interactive SDL3 preview afterwards
         --no-color           skip colour transfer
+        --export-frame FILE  write the transform world -> GLB and the cameras (JSON), so that an
+                             external 3D model can be placed into / projected like the views
+
+EXCHANGE WITH A 3D MODEL
+        --save-solution FILE save the estimated cameras (JSON)
+        --save-views DIR     save the (nudged) input images the solution belongs to
+        --solution FILE      use these cameras instead of estimating them (pass the images
+                             written by --save-views); the reconstruction space is then the same
+                             as in the run that saved them
+        --prior-model FILE   occupancy prior on a world-space lattice (VXPR file, see
+                             src/exchange.rs), e.g. voxelised from a 3D model of the object;
+                             added to the silhouette evidence
+        --prior-model-weight W  weight of the model prior in log-odds (default 1.0; one view that clearly
+                             sees 'outside' counts about 2.2)
 
 RESOLUTION
         --resolution N       longest side of the model in voxels (default: 128, never finer
@@ -115,6 +130,12 @@ struct Opts {
     prior: f32,
     load: LoadOptions,
     quiet: bool,
+    export_frame: Option<PathBuf>,
+    save_solution: Option<PathBuf>,
+    save_views: Option<PathBuf>,
+    solution: Option<PathBuf>,
+    prior_file: Option<PathBuf>,
+    prior_weight: f32,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -152,6 +173,12 @@ fn parse_args() -> Result<Opts, String> {
         prior: 0.5,
         load: LoadOptions::default(),
         quiet: false,
+        export_frame: None,
+        save_solution: None,
+        save_views: None,
+        solution: None,
+        prior_file: None,
+        prior_weight: 1.0,
     };
     let mut it = std::env::args().skip(1);
     fn num<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String> {
@@ -168,6 +195,12 @@ fn parse_args() -> Result<Opts, String> {
             "--rotate" => o.rotate = num(&mut it, "--rotate")?,
             "--report" => o.report = Some(PathBuf::from(it.next().ok_or("--report needs a value")?)),
             "--view" => o.view = true,
+            "--export-frame" => o.export_frame = Some(PathBuf::from(it.next().ok_or("--export-frame needs a value")?)),
+            "--save-solution" => o.save_solution = Some(PathBuf::from(it.next().ok_or("--save-solution needs a value")?)),
+            "--save-views" => o.save_views = Some(PathBuf::from(it.next().ok_or("--save-views needs a value")?)),
+            "--solution" => o.solution = Some(PathBuf::from(it.next().ok_or("--solution needs a value")?)),
+            "--prior-model" => o.prior_file = Some(PathBuf::from(it.next().ok_or("--prior-model needs a value")?)),
+            "--prior-model-weight" => o.prior_weight = num(&mut it, "--prior-model-weight")?,
             "--no-color" => o.colors = false,
             "--resolution" => o.resolution = num(&mut it, "--resolution")?,
             "--voxel" => o.voxel = Some(num(&mut it, "--voxel")?),
@@ -327,9 +360,14 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let loaded = match &o.solution {
+        Some(p) => Some(exchange::load_solution(p, views.len())?),
+        None => None,
+    };
+
     // ---- marker based calibration (angles, pitch, image offsets)
     let mut calib: Option<markers::Calib> = None;
-    if !o.no_markers {
+    if !o.no_markers && loaded.is_none() {
         let tracks = markers::extract_tracks(&views, 12);
         if !o.quiet {
             eprintln!("markers: {} tracks found", tracks.len());
@@ -366,14 +404,25 @@ fn run() -> Result<(), String> {
         eprintln!("estimating angles, pitch and image shifts ({} images)...", views.len());
     }
     // ---- stage 1: angles of every image, found separately (posterised colours: robust against shading)
-    let views_q = if o.stages { markers::quantize_views(&views, 8) } else { views.clone() };
-    let mut sol = estimate::estimate(&views_q, &cfg);
+    let stages = o.stages && loaded.is_none();
+    let mut sol = match loaded {
+        Some(s) => {
+            if !o.quiet {
+                eprintln!("cameras loaded from the solution file - no estimation");
+            }
+            s
+        }
+        None => {
+            let views_q = if stages { markers::quantize_views(&views, 8) } else { views.clone() };
+            estimate::estimate(&views_q, &cfg)
+        }
+    };
     print_result(&views, &sol, o.quiet, "stage 1");
 
     let mut views = views;
-    if o.stages {
+    if stages {
         // ---- stage 2: coarse model -> where does it not fit? -> nudge the images by the minimum
-        let coarse = carve::reconstruct(&views, &sol, None, 64, true, None, false);
+        let coarse = carve::reconstruct(&views, &sol, None, 64, true, None, false, None);
         let mut nudged = Vec::with_capacity(views.len());
         for k in 0..views.len() {
             let rend = refine::render_model(&coarse, &views[k], &sol.cam(k));
@@ -408,7 +457,22 @@ fn run() -> Result<(), String> {
     }
     let views = views;
 
-    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors, o.fine_y, o.repair);
+    if let Some(p) = &o.save_solution {
+        let names: Vec<String> = views.iter().map(|v| v.name.clone()).collect();
+        exchange::save_solution(p, &sol, &names)?;
+    }
+    if let Some(dir) = &o.save_views {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for v in &views {
+            let p = dir.join(&v.name);
+            v.rgba.save(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+    }
+    let prior = match &o.prior_file {
+        Some(p) => Some(exchange::Prior::load(p)?),
+        None => None,
+    };
+    let model = carve::reconstruct(&views, &sol, o.voxel, o.resolution, o.colors, o.fine_y, o.repair, prior.as_ref().map(|p| (p, o.prior_weight)));
     let g = model.grid;
     if !o.quiet {
         eprintln!("voxel grid {}x{}x{} (voxel {:.2} px), {} occupied voxels", g.n[0], g.n[1], g.n[2], g.v, model.count());
@@ -418,6 +482,11 @@ fn run() -> Result<(), String> {
     }
 
     let m = mesh::build_mesh(&model, o.height, o.rotate);
+    if let Some(p) = &o.export_frame {
+        if let Some(fr) = exchange::export_frame(&model, o.height, o.rotate) {
+            exchange::save_frame(p, &fr, &sol, &model.grid)?;
+        }
+    }
     let name = o.output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into());
     mesh::write_glb(&o.output, &m, &name).map_err(|e| format!("{}: {e}", o.output.display()))?;
     if !o.quiet {

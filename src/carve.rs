@@ -2,6 +2,7 @@
 //! summed evidence, removal of floating fragments, colour transfer and debug overlays.
 
 use crate::estimate::Solution;
+use crate::exchange::Prior;
 use crate::model::*;
 use crate::silhouette::{View, LEVELS};
 use rayon::prelude::*;
@@ -21,7 +22,9 @@ impl VoxelModel {
 /// `voxel`: voxel edge in world units (1 world unit = 1 pixel of the reference scale).
 /// `fine_y`: optional range of the model height (fractions 0..1 from the bottom) that is
 /// evaluated with half the voxel size (2x resolution), e.g. the legs.
-pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool, fine_y: Option<(f32, f32)>, repair: bool) -> VoxelModel {
+/// `prior`: optional occupancy prior (e.g. from a 3D model) and its weight, added to the
+/// silhouette evidence before the decision (see `exchange::Prior`).
+pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolution: usize, colors: bool, fine_y: Option<(f32, f32)>, repair: bool, prior: Option<(&Prior, f32)>) -> VoxelModel {
     let (lo, hi) = sol.bounds;
     let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
     let longest = ext.iter().cloned().fold(0.0, f32::max);
@@ -43,10 +46,13 @@ pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolutio
             llr_slab(view, LEVELS - 1, &cams[k], &grid, iz, &sol.noise, chunk, true);
         }
     });
+    if let Some((p, w)) = prior {
+        p.add_to(&grid, &mut total, w, 0.5);
+    }
     let mut occ: Vec<bool> = total.iter().map(|&t| t > sol.noise.thr).collect();
     let mut grid = grid;
     if let Some((a, b)) = fine_y {
-        let (g2, o2, t2) = refine_region(views, &cams, sol, &grid, &occ, a, b);
+        let (g2, o2, t2) = refine_region(views, &cams, sol, &grid, &occ, a, b, prior);
         grid = g2;
         occ = o2;
         total = t2;
@@ -69,7 +75,7 @@ pub fn reconstruct(views: &[View], sol: &Solution, voxel: Option<f32>, resolutio
 
 /// Re-evaluates the evidence with half the voxel size inside a height range; elsewhere the
 /// coarse decision is simply copied to the finer lattice.
-fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[bool], a: f32, b: f32) -> (Grid, Vec<bool>, Vec<f32>) {
+fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[bool], a: f32, b: f32, prior: Option<(&Prior, f32)>) -> (Grid, Vec<bool>, Vec<f32>) {
     let [nx, ny, nz] = g.n;
     let (mut ylo, mut yhi) = (usize::MAX, 0usize);
     for z in 0..nz {
@@ -93,6 +99,9 @@ fn refine_region(views: &[View], cams: &[Cam], sol: &Solution, g: &Grid, occ: &[
             llr_slab(view, LEVELS - 1, &cams[k], &g2, iz, &sol.noise, chunk, true);
         }
     });
+    if let Some((p, w)) = prior {
+        p.add_to(&g2, &mut total, w, 0.5);
+    }
     let span = (yhi - ylo + 1) as f32;
     let mut out = vec![false; g2.len()];
     for z in 0..g2.n[2] {

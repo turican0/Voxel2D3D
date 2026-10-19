@@ -82,6 +82,23 @@ Viewer: drag = rotate, wheel = zoom, space = auto-rotate, `R` = reset, `Esc` = q
    `--rotate` turns it). Vertex colours are written as normalized `UNSIGNED_BYTE` `COLOR_0`
    (linear), which Blender, three.js and Godot read; note that `trimesh` ignores it.
 
+## Exchange with a 3D model (both directions)
+
+A detailed 3D model (e.g. a rigged character) and the voxel reconstruction can correct each other:
+
+```sh
+# 1. reconstruct, keep the cameras, the (nudged) images and the GLB transform
+voxel2d3d frames/*.png --yaw-step 25.714 --vscale 1 -o r0.glb     --save-solution sol.json --save-views views/ --export-frame frame.json
+# 2. external tool: pose / scale the 3D model so it fits r0.glb and the silhouettes
+#    (frame.json gives world <-> GLB and every camera), voxelise it into a VXPR prior
+# 3. reconstruct again with the same cameras and the model as a prior
+voxel2d3d views/*.png --solution sol.json --prior-model prior.vxpr --prior-model-weight 2 -o r1.glb
+```
+
+The prior (`src/exchange.rs`, format `VXPR`) adds `weight * logit(p)` to the evidence of each voxel.
+Regions the model does not cover should be p = 0.5 (neutral). With sprites of a pre-rendered 3D
+scene use `--vscale 1` (true orthographic) - the free estimate stretched the model to 0.52.
+
 ## Conventions
 
 yaw 0 = camera on +Z looking at the origin, yaw 90 = camera on +X; positive pitch = camera above

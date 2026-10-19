@@ -4,6 +4,7 @@
 
 pub mod carve;
 pub mod estimate;
+pub mod exchange;
 pub mod markers;
 pub mod mesh;
 pub mod refine;
